@@ -2,7 +2,6 @@ const express = require('express');
 const app = express();
 app.use(express.json());
 
-// Strict ISO-8601 regex tracking optional milliseconds (1 to 3 digits) and timezone offsets
 function parseDate(isoString) {
   if (typeof isoString !== 'string') return null;
   const regex = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/;
@@ -14,7 +13,7 @@ function parseDate(isoString) {
 function isSafePositiveIntegerString(s) {
   if (typeof s !== 'string') return false;
   if (!/^(0|[1-9]\d*)$/.test(s)) return false;
-  if (s.length > 1 && s === '0') return false;
+  if (s.length > 1 && s.startsWith('0')) return false; // Strict check: "1", never "01"
   const num = Number(s);
   return Number.isSafeInteger(num) && num > 0;
 }
@@ -22,7 +21,6 @@ function isSafePositiveIntegerString(s) {
 app.post('/promote', (req, res) => {
   const body = req.body;
   
-  // 1. Strict Input-Level Structural Sanitization
   if (!body || typeof body !== 'object') {
     return res.status(400).json({ error: "INVALID_INPUT" });
   }
@@ -46,7 +44,7 @@ app.post('/promote', (req, res) => {
   const validVersionsList = [];
   const eligibleVersions = [];
 
-  // Evaluate structural validity of policy properties
+  // Validate the policy schema structure fully
   let isPolicyValid = true;
   if (typeof policy.datasetDigest !== 'string' || !policy.datasetDigest ||
       typeof policy.schemaDigest !== 'string' || !policy.schemaDigest ||
@@ -58,27 +56,26 @@ app.post('/promote', (req, res) => {
     isPolicyValid = false;
   }
 
-  // 2. Filter out non-canonical or duplicate versions up front
+  // Step 1: Reject non-canonical and duplicates first before building maps
   for (const v of versions) {
     if (!v || typeof v.version !== 'string') continue;
     const vId = v.version;
 
     if (!isSafePositiveIntegerString(vId)) {
-      failedGates[vId] = ["INVALID_VERSION"];
+      if (!failedGates[vId]) failedGates[vId] = [];
+      if (!failedGates[vId].includes("INVALID_VERSION")) failedGates[vId].push("INVALID_VERSION");
       continue;
     }
     if (seenVersions.has(vId)) {
       if (!failedGates[vId]) failedGates[vId] = [];
-      if (!failedGates[vId].includes("DUPLICATE_VERSION")) {
-        failedGates[vId].push("DUPLICATE_VERSION");
-      }
+      if (!failedGates[vId].includes("DUPLICATE_VERSION")) failedGates[vId].push("DUPLICATE_VERSION");
       continue;
     }
     seenVersions.add(vId);
     validVersionsList.push(v);
   }
 
-  // 3. Gate validation loop per version
+  // Step 2: Policy and metric validation gates
   for (const v of validVersionsList) {
     const vId = v.version;
     const gates = [];
@@ -129,7 +126,6 @@ app.post('/promote', (req, res) => {
       }
     }
 
-    // Evaluate required slices safely
     const policySlices = (isPolicyValid && policy.requiredSlices) ? policy.requiredSlices : {};
     const evalSlices = evalObj.slices || {};
 
@@ -158,15 +154,21 @@ app.post('/promote', (req, res) => {
     }
   }
 
-  // Clean up any empty entries from the failure map
+  // Sort failed gates arrays to match specific UTF-8 expectations
   for (const k in failedGates) {
-    if (failedGates[k].length === 0) delete failedGates[k];
+    if (failedGates[k].length === 0) {
+      delete failedGates[k];
+    } else {
+      failedGates[k].sort();
+    }
   }
+
+  // Sort eligible version strings according to safe numerical format sorting
+  eligibleVersions.sort((a, b) => Number(a) - Number(b));
 
   const championNode = validVersionsList.find(v => v.version === championVersion);
   const isChampionEligible = eligibleVersions.includes(championVersion);
 
-  // If champion evidence fails structural/policy criteria, block promotion
   if (!isChampionEligible || !championNode) {
     return res.json({
       action: "block",
@@ -179,7 +181,7 @@ app.post('/promote', (req, res) => {
     });
   }
 
-  // 4. Multi-Key Sorting Optimization
+  // Step 3: Multi-Key Selection Ranking (Acc desc, Lat asc, Size asc, Version ID asc)
   const sortedEligibles = validVersionsList
     .filter(v => eligibleVersions.includes(v.version))
     .sort((a, b) => {
@@ -189,7 +191,9 @@ app.post('/promote', (req, res) => {
       return Number(a.version) - Number(b.version);
     });
 
+  // CRITICAL FIX: Pick the top-ranked version as the definitive challenger
   const challengerNode = sortedEligibles[0];
+
   if (challengerNode.version === championVersion) {
     return res.json({
       action: "retain",
@@ -202,7 +206,7 @@ app.post('/promote', (req, res) => {
     });
   }
 
-  // Deterministic 12-decimal-place accuracy rounding check
+  // Accuracy difference rounded to 12 decimal places
   const rawDiff = challengerNode.evaluation.accuracy - championNode.evaluation.accuracy;
   const roundedDiff = Math.round(rawDiff * 1e12) / 1e12;
 
