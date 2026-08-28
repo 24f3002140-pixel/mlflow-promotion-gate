@@ -2,9 +2,9 @@ const express = require('express');
 const app = express();
 app.use(express.json());
 
+// Strict ISO-8601 regex tracking optional milliseconds (1 to 3 digits) and timezone offsets
 function parseDate(isoString) {
   if (typeof isoString !== 'string') return null;
-  // Strict ISO-8601 regex tracking optional milliseconds (1 to 3 digits) and timezone variations
   const regex = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/;
   if (!regex.test(isoString)) return null;
   const ms = Date.parse(isoString);
@@ -21,13 +21,18 @@ function isSafePositiveIntegerString(s) {
 
 app.post('/promote', (req, res) => {
   const body = req.body;
+  
+  // 1. Strict Input-Level Structural Sanitization
   if (!body || typeof body !== 'object') {
     return res.status(400).json({ error: "INVALID_INPUT" });
   }
 
   const { asOf, championVersion, policy, versions } = body;
 
-  if (!policy || typeof policy !== 'object' || !Array.isArray(versions) || typeof championVersion !== 'string') {
+  if (!policy || typeof policy !== 'object' || 
+      !Array.isArray(versions) || 
+      typeof championVersion !== 'string' ||
+      typeof asOf !== 'string') {
     return res.status(400).json({ error: "INVALID_INPUT" });
   }
 
@@ -36,7 +41,13 @@ app.post('/promote', (req, res) => {
     return res.status(400).json({ error: "INVALID_INPUT" });
   }
 
-  // Robust field mapping validations
+  const failedGates = {};
+  const seenVersions = new Set();
+  const validVersionsList = [];
+  const eligibleVersions = [];
+
+  // Evaluate structural validity of policy properties
+  let isPolicyValid = true;
   if (typeof policy.datasetDigest !== 'string' || !policy.datasetDigest ||
       typeof policy.schemaDigest !== 'string' || !policy.schemaDigest ||
       typeof policy.maxAgeSeconds !== 'number' || policy.maxAgeSeconds < 0 ||
@@ -44,16 +55,10 @@ app.post('/promote', (req, res) => {
       typeof policy.maxLatencyMs !== 'number' || !Number.isFinite(policy.maxLatencyMs) || policy.maxLatencyMs < 0 ||
       typeof policy.maxSizeBytes !== 'number' || policy.maxSizeBytes < 0 ||
       typeof policy.minImprovement !== 'number' || !Number.isFinite(policy.minImprovement) || policy.minImprovement < 0 || policy.minImprovement > 1) {
-    return res.status(400).json({ error: "INVALID_INPUT" });
+    isPolicyValid = false;
   }
 
-  const failedGates = {};
-  const seenVersions = new Set();
-  const validVersionsList = [];
-  const eligibleVersions = [];
-  let championNode = null;
-
-  // Step 1: Structural cleanup & Uniqueness verification
+  // 2. Filter out non-canonical or duplicate versions up front
   for (const v of versions) {
     if (!v || typeof v.version !== 'string') continue;
     const vId = v.version;
@@ -73,10 +78,14 @@ app.post('/promote', (req, res) => {
     validVersionsList.push(v);
   }
 
-  // Step 2: Policy Gate Evaluations
+  // 3. Gate validation loop per version
   for (const v of validVersionsList) {
     const vId = v.version;
     const gates = [];
+
+    if (!isPolicyValid) {
+      gates.push("INVALID_POLICY");
+    }
 
     if (!v.evaluation || typeof v.evaluation !== 'object') {
       gates.push("MISSING_EVALUATION");
@@ -93,42 +102,41 @@ app.post('/promote', (req, res) => {
       if (evalCreatedMs > asOfMs) {
         gates.push("FUTURE_EVALUATION");
       }
-      if (asOfMs - policy.maxAgeSeconds * 1000 > evalCreatedMs) {
+      if (isPolicyValid && (asOfMs - policy.maxAgeSeconds * 1000 > evalCreatedMs)) {
         gates.push("STALE_EVALUATION");
       }
     }
 
     if (v.artifactDigest !== evalObj.artifactDigest) gates.push("ARTIFACT_MISMATCH");
-    if (policy.datasetDigest !== evalObj.datasetDigest) gates.push("DATASET_MISMATCH");
-    if (policy.schemaDigest !== evalObj.schemaDigest) gates.push("SCHEMA_MISMATCH");
+    if (isPolicyValid && policy.datasetDigest !== evalObj.datasetDigest) gates.push("DATASET_MISMATCH");
+    if (isPolicyValid && policy.schemaDigest !== evalObj.schemaDigest) gates.push("SCHEMA_MISMATCH");
 
     const acc = evalObj.accuracy;
     const lat = evalObj.latencyMs;
     const sz = evalObj.sizeBytes;
 
-    if (typeof acc !== 'number' || typeof lat !== 'number' || typeof sz !== 'number') {
+    if (typeof acc !== 'number' || typeof lat !== 'number' || typeof sz !== 'number' ||
+        !Number.isFinite(acc) || !Number.isFinite(lat) || !Number.isFinite(sz)) {
       gates.push("NON_FINITE");
     } else {
-      if (!Number.isFinite(acc) || !Number.isFinite(lat) || !Number.isFinite(sz)) {
-        gates.push("NON_FINITE");
-      } else {
-        if (acc < 0 || acc > 1) gates.push("METRIC_RANGE");
-        if (lat < 0) gates.push("METRIC_RANGE");
-        if (sz < 0) gates.push("METRIC_RANGE");
-
+      if (acc < 0 || acc > 1 || lat < 0 || sz < 0) {
+        gates.push("METRIC_RANGE");
+      }
+      if (isPolicyValid) {
         if (!(acc < 0 || acc > 1) && acc < policy.accuracyFloor) gates.push("ACCURACY_FLOOR");
         if (lat >= 0 && lat > policy.maxLatencyMs) gates.push("LATENCY_LIMIT");
         if (sz >= 0 && sz > policy.maxSizeBytes) gates.push("SIZE_LIMIT");
       }
     }
 
-    // Process slices safely if declared
-    const policySlices = policy.requiredSlices || {};
+    // Evaluate required slices safely
+    const policySlices = (isPolicyValid && policy.requiredSlices) ? policy.requiredSlices : {};
     const evalSlices = evalObj.slices || {};
 
     for (const [sliceName, floorValue] of Object.entries(policySlices)) {
       if (typeof floorValue !== 'number' || !Number.isFinite(floorValue) || floorValue < 0 || floorValue > 1) {
-        return res.status(400).json({ error: "INVALID_INPUT" });
+        if (!gates.includes("INVALID_POLICY")) gates.push("INVALID_POLICY");
+        continue;
       }
 
       if (!(sliceName in evalSlices)) {
@@ -148,17 +156,18 @@ app.post('/promote', (req, res) => {
     } else {
       eligibleVersions.push(vId);
     }
-
-    if (vId === championVersion) championNode = v;
   }
 
+  // Clean up any empty entries from the failure map
   for (const k in failedGates) {
     if (failedGates[k].length === 0) delete failedGates[k];
   }
 
-  // Champion eligibility check
+  const championNode = validVersionsList.find(v => v.version === championVersion);
   const isChampionEligible = eligibleVersions.includes(championVersion);
-  if (!isChampionEligible) {
+
+  // If champion evidence fails structural/policy criteria, block promotion
+  if (!isChampionEligible || !championNode) {
     return res.json({
       action: "block",
       championVersion,
@@ -170,12 +179,12 @@ app.post('/promote', (req, res) => {
     });
   }
 
-  // Step 3: Multi-Key Selection Sorting
+  // 4. Multi-Key Sorting Optimization
   const sortedEligibles = validVersionsList
     .filter(v => eligibleVersions.includes(v.version))
     .sort((a, b) => {
       if (b.evaluation.accuracy !== a.evaluation.accuracy) return b.evaluation.accuracy - a.evaluation.accuracy;
-      if (a.evaluation.latencyMs !== a.evaluation.latencyMs) return a.evaluation.latencyMs - b.evaluation.latencyMs;
+      if (a.evaluation.latencyMs !== b.evaluation.latencyMs) return a.evaluation.latencyMs - b.evaluation.latencyMs;
       if (a.evaluation.sizeBytes !== b.evaluation.sizeBytes) return a.evaluation.sizeBytes - b.evaluation.sizeBytes;
       return Number(a.version) - Number(b.version);
     });
@@ -193,7 +202,7 @@ app.post('/promote', (req, res) => {
     });
   }
 
-  // Floating point adjustment decimal step
+  // Deterministic 12-decimal-place accuracy rounding check
   const rawDiff = challengerNode.evaluation.accuracy - championNode.evaluation.accuracy;
   const roundedDiff = Math.round(rawDiff * 1e12) / 1e12;
 
