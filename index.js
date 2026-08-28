@@ -44,7 +44,7 @@ app.post('/promote', (req, res) => {
   const validVersionsList = [];
   const eligibleVersions = [];
 
-  // Validate base policy fields
+  // Validate policy properties
   let isPolicyValid = true;
   if (typeof policy.datasetDigest !== 'string' || !policy.datasetDigest ||
       typeof policy.schemaDigest !== 'string' || !policy.schemaDigest ||
@@ -56,7 +56,7 @@ app.post('/promote', (req, res) => {
     isPolicyValid = false;
   }
 
-  // Step 1: Reject non-canonical and duplicates up front
+  // Step 1: Filter out non-canonical and duplicate values first
   for (const v of versions) {
     if (!v || typeof v.version !== 'string') continue;
     const vId = v.version;
@@ -75,7 +75,7 @@ app.post('/promote', (req, res) => {
     validVersionsList.push(v);
   }
 
-  // Step 2: Policy and metric gate checks
+  // Step 2: Quality metric validation gates
   for (const v of validVersionsList) {
     const vId = v.version;
     const gates = [];
@@ -154,7 +154,6 @@ app.post('/promote', (req, res) => {
     }
   }
 
-  // Sort failed codes fields natively
   for (const k in failedGates) {
     if (failedGates[k].length === 0) {
       delete failedGates[k];
@@ -178,7 +177,7 @@ app.post('/promote', (req, res) => {
     });
   }
 
-  // Step 3: Multi-Key Sorting Priority Selection Criteria
+  // Step 3: Multi-Key Sorting Tie-Breaking
   const sortedEligibles = validVersionsList
     .filter(v => eligibleVersions.includes(v.version))
     .sort((a, b) => {
@@ -188,7 +187,7 @@ app.post('/promote', (req, res) => {
       return Number(a.version) - Number(b.version);
     });
 
-  // FIXED: Explicitly pick the first element from the sorted array
+  // FIXED: Explicitly pick index 0 from the sorted array list
   const challengerNode = sortedEligibles[0];
 
   if (challengerNode.version === championVersion) {
@@ -203,7 +202,7 @@ app.post('/promote', (req, res) => {
     });
   }
 
-  // Calculate rounding step using exactly 12 decimal places
+  // Calculate 12-decimal precision rounded accuracy diffs
   const rawDiff = challengerNode.evaluation.accuracy - championNode.evaluation.accuracy;
   const roundedDiff = Math.round(rawDiff * 1e12) / 1e12;
 
