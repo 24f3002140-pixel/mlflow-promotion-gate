@@ -1,0 +1,12 @@
+{
+  "name": "mlflow-promotion-gate",
+  "version": "1.0.0",
+  "description": "Deterministic MLflow Model Promotion Gate",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
