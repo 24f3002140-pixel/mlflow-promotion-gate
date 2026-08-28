@@ -13,7 +13,7 @@ function parseDate(isoString) {
 function isSafePositiveIntegerString(s) {
   if (typeof s !== 'string') return false;
   if (!/^(0|[1-9]\d*)$/.test(s)) return false;
-  if (s.length > 1 && s.startsWith('0')) return false; // Strict canonical syntax tracking: "1", never "01"
+  if (s.length > 1 && s.startsWith('0')) return false; // "1", never "01"
   const num = Number(s);
   return Number.isSafeInteger(num) && num > 0;
 }
@@ -44,7 +44,7 @@ app.post('/promote', (req, res) => {
   const validVersionsList = [];
   const eligibleVersions = [];
 
-  // Validate base policy structures
+  // Validate base policy fields
   let isPolicyValid = true;
   if (typeof policy.datasetDigest !== 'string' || !policy.datasetDigest ||
       typeof policy.schemaDigest !== 'string' || !policy.schemaDigest ||
@@ -56,7 +56,7 @@ app.post('/promote', (req, res) => {
     isPolicyValid = false;
   }
 
-  // Step 1: Filter out duplicates and non-canonical identifiers up front
+  // Step 1: Reject non-canonical and duplicates up front
   for (const v of versions) {
     if (!v || typeof v.version !== 'string') continue;
     const vId = v.version;
@@ -75,7 +75,7 @@ app.post('/promote', (req, res) => {
     validVersionsList.push(v);
   }
 
-  // Step 2: Policy validation engine processing
+  // Step 2: Policy and metric gate checks
   for (const v of validVersionsList) {
     const vId = v.version;
     const gates = [];
@@ -126,7 +126,6 @@ app.post('/promote', (req, res) => {
       }
     }
 
-    // Process slice floors safely
     const policySlices = (isPolicyValid && policy.requiredSlices) ? policy.requiredSlices : {};
     const evalSlices = evalObj.slices || {};
 
@@ -155,7 +154,7 @@ app.post('/promote', (req, res) => {
     }
   }
 
-  // Cleanup map properties and sort codes using standard UTF-8 sequence ordering
+  // Sort failed codes fields natively
   for (const k in failedGates) {
     if (failedGates[k].length === 0) {
       delete failedGates[k];
@@ -179,7 +178,7 @@ app.post('/promote', (req, res) => {
     });
   }
 
-  // Step 3: Multi-Key Selection Ranking Criteria
+  // Step 3: Multi-Key Sorting Priority Selection Criteria
   const sortedEligibles = validVersionsList
     .filter(v => eligibleVersions.includes(v.version))
     .sort((a, b) => {
@@ -189,7 +188,7 @@ app.post('/promote', (req, res) => {
       return Number(a.version) - Number(b.version);
     });
 
-  // FIXED: Properly target the single winning version node
+  // FIXED: Explicitly pick the first element from the sorted array
   const challengerNode = sortedEligibles[0];
 
   if (challengerNode.version === championVersion) {
@@ -204,7 +203,7 @@ app.post('/promote', (req, res) => {
     });
   }
 
-  // Deterministic 12-decimal-place accuracy rounding check delta calculation
+  // Calculate rounding step using exactly 12 decimal places
   const rawDiff = challengerNode.evaluation.accuracy - championNode.evaluation.accuracy;
   const roundedDiff = Math.round(rawDiff * 1e12) / 1e12;
 
