@@ -13,7 +13,7 @@ function parseDate(isoString) {
 function isSafePositiveIntegerString(s) {
   if (typeof s !== 'string') return false;
   if (!/^(0|[1-9]\d*)$/.test(s)) return false;
-  if (s.length > 1 && s.startsWith('0')) return false; // "1", never "01"
+  if (s.length > 1 && s.startsWith('0')) return false; 
   const num = Number(s);
   return Number.isSafeInteger(num) && num > 0;
 }
@@ -187,7 +187,7 @@ app.post('/promote', (req, res) => {
       return Number(a.version) - Number(b.version);
     });
 
-  // FIXED: Explicitly pick index 0 from the sorted array list
+  // CRITICAL FIX: Extract index 0 explicitly from the sorted array
   const challengerNode = sortedEligibles[0];
 
   if (challengerNode.version === championVersion) {
