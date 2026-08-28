@@ -4,7 +4,8 @@ app.use(express.json());
 
 function parseDate(isoString) {
   if (typeof isoString !== 'string') return null;
-  const regex = /^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,3})?(Z|[+-]\\d{2}:\\d{2})$/;
+  // Strict ISO-8601 regex tracking optional milliseconds (1 to 3 digits) and timezone variations
+  const regex = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/;
   if (!regex.test(isoString)) return null;
   const ms = Date.parse(isoString);
   return isNaN(ms) ? null : ms;
@@ -12,7 +13,7 @@ function parseDate(isoString) {
 
 function isSafePositiveIntegerString(s) {
   if (typeof s !== 'string') return false;
-  if (!/^(0|[1-9]\\d*)$/.test(s)) return false;
+  if (!/^(0|[1-9]\d*)$/.test(s)) return false;
   if (s.length > 1 && s === '0') return false;
   const num = Number(s);
   return Number.isSafeInteger(num) && num > 0;
@@ -26,7 +27,7 @@ app.post('/promote', (req, res) => {
 
   const { asOf, championVersion, policy, versions } = body;
 
-  if (!policy || !Array.isArray(versions) || typeof championVersion !== 'string') {
+  if (!policy || typeof policy !== 'object' || !Array.isArray(versions) || typeof championVersion !== 'string') {
     return res.status(400).json({ error: "INVALID_INPUT" });
   }
 
@@ -35,12 +36,13 @@ app.post('/promote', (req, res) => {
     return res.status(400).json({ error: "INVALID_INPUT" });
   }
 
+  // Robust field mapping validations
   if (typeof policy.datasetDigest !== 'string' || !policy.datasetDigest ||
       typeof policy.schemaDigest !== 'string' || !policy.schemaDigest ||
-      typeof policy.maxAgeSeconds !== 'number' || policy.maxAgeSeconds < 0 || !Number.isSafeInteger(policy.maxAgeSeconds) ||
+      typeof policy.maxAgeSeconds !== 'number' || policy.maxAgeSeconds < 0 ||
       typeof policy.accuracyFloor !== 'number' || !Number.isFinite(policy.accuracyFloor) || policy.accuracyFloor < 0 || policy.accuracyFloor > 1 ||
       typeof policy.maxLatencyMs !== 'number' || !Number.isFinite(policy.maxLatencyMs) || policy.maxLatencyMs < 0 ||
-      typeof policy.maxSizeBytes !== 'number' || policy.maxSizeBytes < 0 || !Number.isSafeInteger(policy.maxSizeBytes) ||
+      typeof policy.maxSizeBytes !== 'number' || policy.maxSizeBytes < 0 ||
       typeof policy.minImprovement !== 'number' || !Number.isFinite(policy.minImprovement) || policy.minImprovement < 0 || policy.minImprovement > 1) {
     return res.status(400).json({ error: "INVALID_INPUT" });
   }
@@ -51,6 +53,7 @@ app.post('/promote', (req, res) => {
   const eligibleVersions = [];
   let championNode = null;
 
+  // Step 1: Structural cleanup & Uniqueness verification
   for (const v of versions) {
     if (!v || typeof v.version !== 'string') continue;
     const vId = v.version;
@@ -70,11 +73,12 @@ app.post('/promote', (req, res) => {
     validVersionsList.push(v);
   }
 
+  // Step 2: Policy Gate Evaluations
   for (const v of validVersionsList) {
     const vId = v.version;
     const gates = [];
 
-    if (!v.evaluation) {
+    if (!v.evaluation || typeof v.evaluation !== 'object') {
       gates.push("MISSING_EVALUATION");
       failedGates[vId] = gates;
       continue;
@@ -94,15 +98,9 @@ app.post('/promote', (req, res) => {
       }
     }
 
-    if (v.artifactDigest !== evalObj.artifactDigest) {
-      gates.push("ARTIFACT_MISMATCH");
-    }
-    if (policy.datasetDigest !== evalObj.datasetDigest) {
-      gates.push("DATASET_MISMATCH");
-    }
-    if (policy.schemaDigest !== evalObj.schemaDigest) {
-      gates.push("SCHEMA_MISMATCH");
-    }
+    if (v.artifactDigest !== evalObj.artifactDigest) gates.push("ARTIFACT_MISMATCH");
+    if (policy.datasetDigest !== evalObj.datasetDigest) gates.push("DATASET_MISMATCH");
+    if (policy.schemaDigest !== evalObj.schemaDigest) gates.push("SCHEMA_MISMATCH");
 
     const acc = evalObj.accuracy;
     const lat = evalObj.latencyMs;
@@ -116,14 +114,15 @@ app.post('/promote', (req, res) => {
       } else {
         if (acc < 0 || acc > 1) gates.push("METRIC_RANGE");
         if (lat < 0) gates.push("METRIC_RANGE");
-        if (sz < 0 || !Number.isSafeInteger(sz)) gates.push("METRIC_RANGE");
+        if (sz < 0) gates.push("METRIC_RANGE");
 
         if (!(acc < 0 || acc > 1) && acc < policy.accuracyFloor) gates.push("ACCURACY_FLOOR");
         if (lat >= 0 && lat > policy.maxLatencyMs) gates.push("LATENCY_LIMIT");
-        if ((sz >= 0 && Number.isSafeInteger(sz)) && sz > policy.maxSizeBytes) gates.push("SIZE_LIMIT");
+        if (sz >= 0 && sz > policy.maxSizeBytes) gates.push("SIZE_LIMIT");
       }
     }
 
+    // Process slices safely if declared
     const policySlices = policy.requiredSlices || {};
     const evalSlices = evalObj.slices || {};
 
@@ -150,17 +149,15 @@ app.post('/promote', (req, res) => {
       eligibleVersions.push(vId);
     }
 
-    if (vId === championVersion) {
-      championNode = v;
-    }
+    if (vId === championVersion) championNode = v;
   }
 
   for (const k in failedGates) {
     if (failedGates[k].length === 0) delete failedGates[k];
   }
 
+  // Champion eligibility check
   const isChampionEligible = eligibleVersions.includes(championVersion);
-
   if (!isChampionEligible) {
     return res.json({
       action: "block",
@@ -173,23 +170,17 @@ app.post('/promote', (req, res) => {
     });
   }
 
-  const sortedEligibles = [...validVersionsList]
+  // Step 3: Multi-Key Selection Sorting
+  const sortedEligibles = validVersionsList
     .filter(v => eligibleVersions.includes(v.version))
     .sort((a, b) => {
-      if (b.evaluation.accuracy !== a.evaluation.accuracy) {
-        return b.evaluation.accuracy - a.evaluation.accuracy;
-      }
-      if (a.evaluation.latencyMs !== b.evaluation.latencyMs) {
-        return a.evaluation.latencyMs - b.evaluation.latencyMs;
-      }
-      if (a.evaluation.sizeBytes !== b.evaluation.sizeBytes) {
-        return a.evaluation.sizeBytes - b.evaluation.sizeBytes;
-      }
+      if (b.evaluation.accuracy !== a.evaluation.accuracy) return b.evaluation.accuracy - a.evaluation.accuracy;
+      if (a.evaluation.latencyMs !== a.evaluation.latencyMs) return a.evaluation.latencyMs - b.evaluation.latencyMs;
+      if (a.evaluation.sizeBytes !== b.evaluation.sizeBytes) return a.evaluation.sizeBytes - b.evaluation.sizeBytes;
       return Number(a.version) - Number(b.version);
     });
 
   const challengerNode = sortedEligibles[0];
-  
   if (challengerNode.version === championVersion) {
     return res.json({
       action: "retain",
@@ -202,6 +193,7 @@ app.post('/promote', (req, res) => {
     });
   }
 
+  // Floating point adjustment decimal step
   const rawDiff = challengerNode.evaluation.accuracy - championNode.evaluation.accuracy;
   const roundedDiff = Math.round(rawDiff * 1e12) / 1e12;
 
@@ -212,10 +204,7 @@ app.post('/promote', (req, res) => {
       selectedVersion: challengerNode.version,
       eligibleVersions,
       failedGates,
-      aliasMutation: {
-        alias: "champion",
-        version: challengerNode.version
-      },
+      aliasMutation: { alias: "champion", version: challengerNode.version },
       evidence: challengerNode.evaluation
     });
   } else {
@@ -231,7 +220,5 @@ app.post('/promote', (req, res) => {
   }
 });
 
-app.use((req, res) => res.status(404).json({ error: "NOT_FOUND" }));
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
