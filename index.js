@@ -1,196 +1,428 @@
-const express = require('express');
+```javascript
+const express = require("express");
+
 const app = express();
-app.use(express.json());
+app.use(express.json({ strict: true }));
 
-function parseDate(isoString) {
-  if (typeof isoString !== 'string') return null;
-  const regex = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/;
-  if (!regex.test(isoString)) return null;
-  const ms = Date.parse(isoString);
-  return isNaN(ms) ? null : ms;
+const PORT = process.env.PORT || 10000;
+const SAFE_MAX = Number.MAX_SAFE_INTEGER;
+
+function invalidInput(res) {
+  return res.status(400).json({ error: "INVALID_INPUT" });
 }
 
-function isSafePositiveIntegerString(s) {
-  if (typeof s !== 'string') return false;
-  if (!/^(0|[1-9]\d*)$/.test(s)) return false;
-  if (s.length > 1 && s.startsWith('0')) return false; 
-  const num = Number(s);
-  return Number.isSafeInteger(num) && num > 0;
+function isPlainObject(x) {
+  return x !== null && typeof x === "object" && !Array.isArray(x);
 }
 
-app.post('/promote', (req, res) => {
-  const body = req.body;
-  
-  if (!body || typeof body !== 'object') {
-    return res.status(400).json({ error: "INVALID_INPUT" });
+function parseInstant(x) {
+  if (typeof x !== "string") return null;
+
+  // YYYY-MM-DDTHH:mm:ss[.sss](Z|±HH:mm)
+  const re =
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+  if (!re.test(x)) return null;
+
+  const ms = Date.parse(x);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function isSafePositiveVersion(x) {
+  if (typeof x !== "string") return false;
+  if (!/^[1-9]\d*$/.test(x)) return false;
+
+  const n = Number(x);
+  return Number.isSafeInteger(n) && n > 0;
+}
+
+function isSafeNonNegativeInteger(x) {
+  return (
+    typeof x === "number" &&
+    Number.isSafeInteger(x) &&
+    x >= 0
+  );
+}
+
+function isFiniteNumber(x) {
+  return typeof x === "number" && Number.isFinite(x);
+}
+
+function isUnitInterval(x) {
+  return isFiniteNumber(x) && x >= 0 && x <= 1;
+}
+
+function addGate(gates, code) {
+  if (!gates.includes(code)) gates.push(code);
+}
+
+function sortCodes(codes) {
+  return [...new Set(codes)].sort();
+}
+
+function validatePolicy(policy) {
+  if (!isPlainObject(policy)) return false;
+
+  if (typeof policy.datasetDigest !== "string" || policy.datasetDigest.length === 0)
+    return false;
+
+  if (typeof policy.schemaDigest !== "string" || policy.schemaDigest.length === 0)
+    return false;
+
+  if (!isSafeNonNegativeInteger(policy.maxAgeSeconds))
+    return false;
+
+  if (!isUnitInterval(policy.accuracyFloor))
+    return false;
+
+  if (!isFiniteNumber(policy.maxLatencyMs) || policy.maxLatencyMs < 0)
+    return false;
+
+  if (!isSafeNonNegativeInteger(policy.maxSizeBytes))
+    return false;
+
+  if (!isUnitInterval(policy.minImprovement))
+    return false;
+
+  if (!isPlainObject(policy.requiredSlices))
+    return false;
+
+  for (const [name, floor] of Object.entries(policy.requiredSlices)) {
+    if (!isUnitInterval(floor)) return false;
   }
 
-  const { asOf, championVersion, policy, versions } = body;
+  return true;
+}
 
-  if (!policy || typeof policy !== 'object' || 
-      !Array.isArray(versions) || 
-      typeof championVersion !== 'string' ||
-      typeof asOf !== 'string') {
-    return res.status(400).json({ error: "INVALID_INPUT" });
-  }
+app.post("/promote", (req, res) => {
+  try {
+    const body = req.body;
 
-  const asOfMs = parseDate(asOf);
-  if (asOfMs === null) {
-    return res.status(400).json({ error: "INVALID_INPUT" });
-  }
-
-  const failedGates = {};
-  const seenVersions = new Set();
-  const validVersionsList = [];
-  const eligibleVersions = [];
-
-  // Validate policy properties
-  let isPolicyValid = true;
-  if (typeof policy.datasetDigest !== 'string' || !policy.datasetDigest ||
-      typeof policy.schemaDigest !== 'string' || !policy.schemaDigest ||
-      typeof policy.maxAgeSeconds !== 'number' || policy.maxAgeSeconds < 0 || !Number.isSafeInteger(policy.maxAgeSeconds) ||
-      typeof policy.accuracyFloor !== 'number' || !Number.isFinite(policy.accuracyFloor) || policy.accuracyFloor < 0 || policy.accuracyFloor > 1 ||
-      typeof policy.maxLatencyMs !== 'number' || !Number.isFinite(policy.maxLatencyMs) || policy.maxLatencyMs < 0 ||
-      typeof policy.maxSizeBytes !== 'number' || policy.maxSizeBytes < 0 || !Number.isSafeInteger(policy.maxSizeBytes) ||
-      typeof policy.minImprovement !== 'number' || !Number.isFinite(policy.minImprovement) || policy.minImprovement < 0 || policy.minImprovement > 1) {
-    isPolicyValid = false;
-  }
-
-  // Step 1: Filter out non-canonical and duplicate values first
-  for (const v of versions) {
-    if (!v || typeof v.version !== 'string') continue;
-    const vId = v.version;
-
-    if (!isSafePositiveIntegerString(vId)) {
-      if (!failedGates[vId]) failedGates[vId] = [];
-      if (!failedGates[vId].includes("INVALID_VERSION")) failedGates[vId].push("INVALID_VERSION");
-      continue;
-    }
-    if (seenVersions.has(vId)) {
-      if (!failedGates[vId]) failedGates[vId] = [];
-      if (!failedGates[vId].includes("DUPLICATE_VERSION")) failedGates[vId].push("DUPLICATE_VERSION");
-      continue;
-    }
-    seenVersions.add(vId);
-    validVersionsList.push(v);
-  }
-
-  // Step 2: Quality metric validation gates
-  for (const v of validVersionsList) {
-    const vId = v.version;
-    const gates = [];
-
-    if (!isPolicyValid) {
-      gates.push("INVALID_POLICY");
+    if (!isPlainObject(body)) {
+      return invalidInput(res);
     }
 
-    if (!v.evaluation || typeof v.evaluation !== 'object') {
-      gates.push("MISSING_EVALUATION");
-      failedGates[vId] = gates;
-      continue;
+    const {
+      asOf,
+      championVersion,
+      policy,
+      versions
+    } = body;
+
+    /*
+     * Only these are HTTP-400 structural/input errors.
+     */
+    if (
+      typeof asOf !== "string" ||
+      typeof championVersion !== "string" ||
+      !isPlainObject(policy) ||
+      !Array.isArray(versions)
+    ) {
+      return invalidInput(res);
     }
 
-    const evalObj = v.evaluation;
-    const evalCreatedMs = parseDate(evalObj.createdAt);
+    const asOfMs = parseInstant(asOf);
 
-    if (evalCreatedMs === null) {
-      gates.push("INVALID_TIMESTAMP");
-    } else {
-      if (evalCreatedMs > asOfMs) {
-        gates.push("FUTURE_EVALUATION");
-      }
-      if (isPolicyValid && (asOfMs - (policy.maxAgeSeconds * 1000) > evalCreatedMs)) {
-        gates.push("STALE_EVALUATION");
-      }
+    if (asOfMs === null) {
+      return invalidInput(res);
     }
 
-    if (v.artifactDigest !== evalObj.artifactDigest) gates.push("ARTIFACT_MISMATCH");
-    if (isPolicyValid && policy.datasetDigest !== evalObj.datasetDigest) gates.push("DATASET_MISMATCH");
-    if (isPolicyValid && policy.schemaDigest !== evalObj.schemaDigest) gates.push("SCHEMA_MISMATCH");
+    const policyValid = validatePolicy(policy);
 
-    const acc = evalObj.accuracy;
-    const lat = evalObj.latencyMs;
-    const sz = evalObj.sizeBytes;
+    const failedGates = {};
+    const seen = new Set();
+    const uniqueVersions = [];
 
-    if (typeof acc !== 'number' || typeof lat !== 'number' || typeof sz !== 'number' ||
-        !Number.isFinite(acc) || !Number.isFinite(lat) || !Number.isFinite(sz)) {
-      gates.push("NON_FINITE");
-    } else {
-      if (acc < 0 || acc > 1 || lat < 0 || sz < 0 || !Number.isSafeInteger(sz)) {
-        gates.push("METRIC_RANGE");
-      }
-      if (isPolicyValid) {
-        if (!(acc < 0 || acc > 1) && acc < policy.accuracyFloor) gates.push("ACCURACY_FLOOR");
-        if (lat >= 0 && lat > policy.maxLatencyMs) gates.push("LATENCY_LIMIT");
-        if ((sz >= 0 && Number.isSafeInteger(sz)) && sz > policy.maxSizeBytes) gates.push("SIZE_LIMIT");
-      }
-    }
-
-    const policySlices = (isPolicyValid && policy.requiredSlices) ? policy.requiredSlices : {};
-    const evalSlices = evalObj.slices || {};
-
-    for (const [sliceName, floorValue] of Object.entries(policySlices)) {
-      if (typeof floorValue !== 'number' || !Number.isFinite(floorValue) || floorValue < 0 || floorValue > 1) {
-        if (!gates.includes("INVALID_POLICY")) gates.push("INVALID_POLICY");
+    /*
+     * IMPORTANT:
+     * Reject every duplicate/noncanonical occurrence before
+     * constructing the lookup map.
+     */
+    for (const v of versions) {
+      if (!isPlainObject(v) || typeof v.version !== "string") {
         continue;
       }
 
-      if (!(sliceName in evalSlices)) {
-        gates.push(`MISSING_SLICE:${sliceName}`);
+      const id = v.version;
+
+      if (!isSafePositiveVersion(id)) {
+        if (!failedGates[id]) failedGates[id] = [];
+        addGate(failedGates[id], "INVALID_VERSION");
+        continue;
+      }
+
+      if (seen.has(id)) {
+        if (!failedGates[id]) failedGates[id] = [];
+        addGate(failedGates[id], "DUPLICATE_VERSION");
+        continue;
+      }
+
+      seen.add(id);
+      uniqueVersions.push(v);
+    }
+
+    const eligible = [];
+
+    for (const version of uniqueVersions) {
+      const id = version.version;
+      const gates = [];
+
+      if (!policyValid) {
+        addGate(gates, "INVALID_POLICY");
+      }
+
+      /*
+       * Evaluation must be an object.
+       */
+      if (!isPlainObject(version.evaluation)) {
+        addGate(gates, "MISSING_EVALUATION");
+        failedGates[id] = sortCodes(gates);
+        continue;
+      }
+
+      const ev = version.evaluation;
+
+      /*
+       * Timestamp validation.
+       */
+      const createdMs = parseInstant(ev.createdAt);
+
+      if (createdMs === null) {
+        addGate(gates, "INVALID_TIMESTAMP");
       } else {
-        const val = evalSlices[sliceName];
-        if (typeof val !== 'number' || !Number.isFinite(val) || val < 0 || val > 1) {
-          gates.push(`SLICE_RANGE:${sliceName}`);
-        } else if (val < floorValue) {
-          gates.push(`SLICE_FLOOR:${sliceName}`);
+        if (createdMs > asOfMs) {
+          addGate(gates, "FUTURE_EVALUATION");
         }
+
+        if (
+          policyValid &&
+          createdMs < asOfMs - policy.maxAgeSeconds * 1000
+        ) {
+          addGate(gates, "STALE_EVALUATION");
+        }
+      }
+
+      /*
+       * Artifact lineage.
+       */
+      if (
+        typeof version.artifactDigest !== "string" ||
+        version.artifactDigest !== ev.artifactDigest
+      ) {
+        addGate(gates, "ARTIFACT_MISMATCH");
+      }
+
+      /*
+       * Dataset/schema lineage.
+       */
+      if (
+        policyValid &&
+        ev.datasetDigest !== policy.datasetDigest
+      ) {
+        addGate(gates, "DATASET_MISMATCH");
+      }
+
+      if (
+        policyValid &&
+        ev.schemaDigest !== policy.schemaDigest
+      ) {
+        addGate(gates, "SCHEMA_MISMATCH");
+      }
+
+      /*
+       * Aggregate metrics.
+       */
+      const accuracy = ev.accuracy;
+      const latency = ev.latencyMs;
+      const size = ev.sizeBytes;
+
+      const metricsFinite =
+        isFiniteNumber(accuracy) &&
+        isFiniteNumber(latency) &&
+        isFiniteNumber(size);
+
+      if (!metricsFinite) {
+        addGate(gates, "NON_FINITE");
+      } else {
+        if (
+          !isUnitInterval(accuracy) ||
+          latency < 0 ||
+          size < 0 ||
+          !Number.isSafeInteger(size)
+        ) {
+          addGate(gates, "METRIC_RANGE");
+        }
+
+        if (policyValid) {
+          if (
+            isUnitInterval(accuracy) &&
+            accuracy < policy.accuracyFloor
+          ) {
+            addGate(gates, "ACCURACY_FLOOR");
+          }
+
+          if (
+            latency >= 0 &&
+            latency > policy.maxLatencyMs
+          ) {
+            addGate(gates, "LATENCY_LIMIT");
+          }
+
+          if (
+            size >= 0 &&
+            Number.isSafeInteger(size) &&
+            size > policy.maxSizeBytes
+          ) {
+            addGate(gates, "SIZE_LIMIT");
+          }
+        }
+      }
+
+      /*
+       * Required slices.
+       */
+      if (policyValid) {
+        const slices = isPlainObject(ev.slices)
+          ? ev.slices
+          : {};
+
+        for (const [sliceName, floor] of Object.entries(
+          policy.requiredSlices
+        )) {
+          if (!(sliceName in slices)) {
+            addGate(
+              gates,
+              `MISSING_SLICE:${sliceName}`
+            );
+            continue;
+          }
+
+          const value = slices[sliceName];
+
+          if (!isUnitInterval(value)) {
+            addGate(
+              gates,
+              `SLICE_RANGE:${sliceName}`
+            );
+          } else if (value < floor) {
+            addGate(
+              gates,
+              `SLICE_FLOOR:${sliceName}`
+            );
+          }
+        }
+      }
+
+      const finalCodes = sortCodes(gates);
+
+      if (finalCodes.length > 0) {
+        failedGates[id] = finalCodes;
+      } else {
+        eligible.push(version);
       }
     }
 
-    if (gates.length > 0) {
-      failedGates[vId] = Array.from(new Set(gates)).sort();
-    } else {
-      eligibleVersions.push(vId);
-    }
-  }
+    /*
+     * Sort eligible versions deterministically:
+     * accuracy DESC
+     * latency ASC
+     * size ASC
+     * numeric version ASC
+     */
+    eligible.sort((a, b) => {
+      const ea = a.evaluation;
+      const eb = b.evaluation;
 
-  for (const k in failedGates) {
-    if (failedGates[k].length === 0) {
-      delete failedGates[k];
-    } else {
-      failedGates[k].sort();
-    }
-  }
+      if (eb.accuracy !== ea.accuracy) {
+        return eb.accuracy - ea.accuracy;
+      }
 
-  const championNode = validVersionsList.find(v => v.version === championVersion);
-  const isChampionEligible = eligibleVersions.includes(championVersion);
+      if (ea.latencyMs !== eb.latencyMs) {
+        return ea.latencyMs - eb.latencyMs;
+      }
 
-  if (!isChampionEligible || !championNode) {
-    return res.json({
-      action: "block",
-      championVersion,
-      selectedVersion: null,
-      eligibleVersions,
-      failedGates,
-      aliasMutation: null,
-      evidence: null
-    });
-  }
+      if (ea.sizeBytes !== eb.sizeBytes) {
+        return ea.sizeBytes - eb.sizeBytes;
+      }
 
-  // Step 3: Multi-Key Sorting Tie-Breaking
-  const sortedEligibles = validVersionsList
-    .filter(v => eligibleVersions.includes(v.version))
-    .sort((a, b) => {
-      if (b.evaluation.accuracy !== a.evaluation.accuracy) return b.evaluation.accuracy - a.evaluation.accuracy;
-      if (a.evaluation.latencyMs !== b.evaluation.latencyMs) return a.evaluation.latencyMs - b.evaluation.latencyMs;
-      if (a.evaluation.sizeBytes !== b.evaluation.sizeBytes) return a.evaluation.sizeBytes - b.evaluation.sizeBytes;
       return Number(a.version) - Number(b.version);
     });
 
-  // CRITICAL FIX: Extract index 0 explicitly from the sorted array
-  const challengerNode = sortedEligibles[0];
+    const eligibleVersions = eligible.map(v => v.version);
 
-  if (challengerNode.version === championVersion) {
+    /*
+     * Find champion only among the canonical, unique entries.
+     */
+    const champion = uniqueVersions.find(
+      v => v.version === championVersion
+    );
+
+    const championEligible =
+      champion !== undefined &&
+      eligibleVersions.includes(championVersion);
+
+    /*
+     * Invalid champion evidence blocks promotion.
+     */
+    if (!championEligible) {
+      return res.json({
+        action: "block",
+        championVersion,
+        selectedVersion: null,
+        eligibleVersions,
+        failedGates,
+        aliasMutation: null,
+        evidence: null
+      });
+    }
+
+    /*
+     * Winner is the first ranked eligible version.
+     */
+    const winner = eligible[0];
+
+    /*
+     * If champion is already the best eligible version,
+     * retain it.
+     */
+    if (winner.version === championVersion) {
+      return res.json({
+        action: "retain",
+        championVersion,
+        selectedVersion: championVersion,
+        eligibleVersions,
+        failedGates,
+        aliasMutation: null,
+        evidence: champion.evaluation
+      });
+    }
+
+    /*
+     * Accuracy improvement rounded to exactly 12 decimals.
+     */
+    const rawImprovement =
+      winner.evaluation.accuracy -
+      champion.evaluation.accuracy;
+
+    const improvement =
+      Math.round((rawImprovement + Number.EPSILON) * 1e12) /
+      1e12;
+
+    if (improvement >= policy.minImprovement) {
+      return res.json({
+        action: "promote",
+        championVersion,
+        selectedVersion: winner.version,
+        eligibleVersions,
+        failedGates,
+        aliasMutation: {
+          alias: "champion",
+          version: winner.version
+        },
+        evidence: winner.evaluation
+      });
+    }
+
     return res.json({
       action: "retain",
       championVersion,
@@ -198,36 +430,22 @@ app.post('/promote', (req, res) => {
       eligibleVersions,
       failedGates,
       aliasMutation: null,
-      evidence: championNode.evaluation
+      evidence: champion.evaluation
     });
-  }
-
-  // Calculate 12-decimal precision rounded accuracy diffs
-  const rawDiff = challengerNode.evaluation.accuracy - championNode.evaluation.accuracy;
-  const roundedDiff = Math.round(rawDiff * 1e12) / 1e12;
-
-  if (roundedDiff >= policy.minImprovement) {
-    return res.json({
-      action: "promote",
-      championVersion,
-      selectedVersion: challengerNode.version,
-      eligibleVersions,
-      failedGates,
-      aliasMutation: { alias: "champion", version: challengerNode.version },
-      evidence: challengerNode.evaluation
-    });
-  } else {
-    return res.json({
-      action: "retain",
-      championVersion,
-      selectedVersion: championVersion,
-      eligibleVersions,
-      failedGates,
-      aliasMutation: null,
-      evidence: championNode.evaluation
-    });
+  } catch (err) {
+    /*
+     * Never leak an Express HTML 500 page.
+     * Unexpected malformed input is treated as INVALID_INPUT.
+     */
+    return res.status(400).json({ error: "INVALID_INPUT" });
   }
 });
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+app.get("/", (req, res) => {
+  res.json({ service: "mlflow-promotion-gate" });
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server listening on port ${PORT}`);
+});
+```
